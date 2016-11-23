@@ -27,8 +27,6 @@ type Conn struct {
 func (conn Conn) GetUrl(method, bucketName, objectName string, expire int) (string, string, string) {
 	uri := conn.url.getURL(bucketName, objectName, "")
 	resource := conn.url.getResource(bucketName, objectName, "")
-	fmt.Fprintf(os.Stderr, "uri=%v\n", uri)
-	fmt.Fprintf(os.Stderr, "resource=%v\n", resource)
 	req := &http.Request{
 		Method:     method,
 		URL:        uri,
@@ -43,7 +41,6 @@ func (conn Conn) GetUrl(method, bucketName, objectName string, expire int) (stri
 	req.Header.Set(HTTPHeaderDate, fmt.Sprintf("%d", date))
 	conn.signHeader(req, resource)
 	signstr := req.Header.Get(HTTPHeaderAuthorization)
-	fmt.Fprintf(os.Stderr, "signstr=%s\n", signstr)
 	index := strings.Index(signstr, ":")
 	return uri.String(), signstr[index+1:], fmt.Sprintf("%d", date)
 }
