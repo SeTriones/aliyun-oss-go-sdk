@@ -24,6 +24,30 @@ type Conn struct {
 	url    *urlMaker
 }
 
+func (conn Conn) GetUrl(method, bucketName, objectName string, expire int) (string, string, string) {
+	uri := conn.url.getURL(bucketName, objectName, "")
+	resource := conn.url.getResource(bucketName, objectName, "")
+	fmt.Fprintf(os.Stderr, "uri=%v\n", uri)
+	fmt.Fprintf(os.Stderr, "resource=%v\n", resource)
+	req := &http.Request{
+		Method:     method,
+		URL:        uri,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+		Host:       uri.Host,
+	}
+	date := time.Now().Unix()
+	date = date + int64(expire)
+	req.Header.Set(HTTPHeaderDate, fmt.Sprintf("%d", date))
+	conn.signHeader(req, resource)
+	signstr := req.Header.Get(HTTPHeaderAuthorization)
+	fmt.Fprintf(os.Stderr, "signstr=%s\n", signstr)
+	index := strings.Index(signstr, ":")
+	return uri.String(), signstr[index+1:], fmt.Sprintf("%d", date)
+}
+
 // Do 处理请求，返回响应结果。
 func (conn Conn) Do(method, bucketName, objectName, urlParams, subResource string,
 	headers map[string]string, data io.Reader, initCRC uint64) (*Response, error) {
