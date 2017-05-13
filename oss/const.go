@@ -1,5 +1,7 @@
 package oss
 
+import "os"
+
 // ACLType Bucket/Object的访问控制
 type ACLType string
 
@@ -26,6 +28,20 @@ const (
 
 	// MetaReplace 目标对象使用自定义的META
 	MetaReplace MetadataDirectiveType = "REPLACE"
+)
+
+// StorageClassType Bucket的存储类型
+type StorageClassType string
+
+const (
+	// StorageStandard 标准存储模式
+	StorageStandard StorageClassType = "Standard"
+
+	// StorageIA IA存储模式
+	StorageIA StorageClassType = "IA"
+
+	// StorageArchive Archive存储模式
+	StorageArchive StorageClassType = "Archive"
 )
 
 // Http头标签
@@ -69,14 +85,20 @@ const (
 	HTTPHeaderOssNextAppendPosition          = "X-Oss-Next-Append-Position"
 	HTTPHeaderOssRequestID                   = "X-Oss-Request-Id"
 	HTTPHeaderOssCRC64                       = "X-Oss-Hash-Crc64ecma"
+	HTTPHeaderOssSymlinkTarget               = "X-Oss-Symlink-Target"
 )
 
 // 其它常量
 const (
 	MaxPartSize = 5 * 1024 * 1024 * 1024 // 文件片最大值，5GB
-	MinPartSize = 100 * 1024             // 文件片最小值，100KB
+	MinPartSize = 100 * 1024             // 文件片最小值，100KBß
+
+	FilePermMode = os.FileMode(0664) // 新建文件默认权限
 
 	TempFilePrefix = "oss-go-temp-" // 临时文件前缀
+	TempFileSuffix = ".temp"        // 临时文件后缀
 
-	Version = "1.2.1" // Go sdk版本
+	CheckpointFileSuffix = ".cp" // Checkpoint文件后缀
+
+	Version = "1.3.0" // Go sdk版本
 )

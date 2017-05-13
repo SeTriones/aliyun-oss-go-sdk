@@ -2,12 +2,12 @@ package oss
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,11 +24,13 @@ const (
 	routineNum         = "x-routine-num"
 	checkpointConfig   = "x-cp-config"
 	initCRC64          = "init-crc64"
+	progressListener   = "x-progress-listener"
+	storageClass       = "storage-class"
 )
 
 type (
 	optionValue struct {
-		Value string
+		Value interface{}
 		Type  optionType
 	}
 
@@ -84,6 +86,11 @@ func Meta(key, value string) Option {
 // Range is an option to set Range header, [start, end]
 func Range(start, end int64) Option {
 	return setHeader(HTTPHeaderRange, fmt.Sprintf("bytes=%d-%d", start, end))
+}
+
+// NormalizedRange is an option to set Range header, such as 1024-2048 or 1024- or -2048
+func NormalizedRange(nr string) Option {
+	return setHeader(HTTPHeaderRange, fmt.Sprintf("bytes=%s", strings.TrimSpace(nr)))
 }
 
 // AcceptEncoding is an option to set Accept-Encoding header
@@ -158,6 +165,11 @@ func ObjectACL(acl ACLType) Option {
 	return setHeader(HTTPHeaderOssObjectACL, string(acl))
 }
 
+// symlinkTarget is an option to set X-Oss-Symlink-Target
+func symlinkTarget(targetObjectKey string) Option {
+	return setHeader(HTTPHeaderOssSymlinkTarget, targetObjectKey)
+}
+
 // Origin is an option to set Origin header
 func Origin(value string) Option {
 	return setHeader(HTTPHeaderOrigin, value)
@@ -205,9 +217,15 @@ func UploadIDMarker(value string) Option {
 
 // DeleteObjectsQuiet DeleteObjects详细(verbose)模式或简单(quiet)模式，默认详细模式。
 func DeleteObjectsQuiet(isQuiet bool) Option {
-	return addArg(deleteObjectsQuiet, strconv.FormatBool(isQuiet))
+	return addArg(deleteObjectsQuiet, isQuiet)
 }
 
+// StorageClass bucket的存储方式
+func StorageClass(value StorageClassType) Option {
+	return addArg(storageClass, value)
+}
+
+// 断点续传配置，包括是否启用、cp文件
 type cpConfig struct {
 	IsEnable bool
 	FilePath string
@@ -215,23 +233,27 @@ type cpConfig struct {
 
 // Checkpoint DownloadFile/UploadFile是否开启checkpoint及checkpoint文件路径
 func Checkpoint(isEnable bool, filePath string) Option {
-	res, _ := json.Marshal(cpConfig{isEnable, filePath})
-	return addArg(checkpointConfig, string(res))
+	return addArg(checkpointConfig, &cpConfig{isEnable, filePath})
 }
 
 // Routines DownloadFile/UploadFile并发数
 func Routines(n int) Option {
-	return addArg(routineNum, strconv.Itoa(n))
+	return addArg(routineNum, n)
 }
 
 // InitCRC AppendObject CRC的校验的初始值
 func InitCRC(initCRC uint64) Option {
-	return addArg(initCRC64, strconv.FormatUint(initCRC, 10))
+	return addArg(initCRC64, initCRC)
 }
 
-func setHeader(key, value string) Option {
+// Progress set progress listener
+func Progress(listener ProgressListener) Option {
+	return addArg(progressListener, listener)
+}
+
+func setHeader(key string, value interface{}) Option {
 	return func(params map[string]optionValue) error {
-		if value == "" {
+		if value == nil {
 			return nil
 		}
 		params[key] = optionValue{value, optionHTTP}
@@ -239,9 +261,9 @@ func setHeader(key, value string) Option {
 	}
 }
 
-func addParam(key, value string) Option {
+func addParam(key string, value interface{}) Option {
 	return func(params map[string]optionValue) error {
-		if value == "" {
+		if value == nil {
 			return nil
 		}
 		params[key] = optionValue{value, optionParam}
@@ -249,9 +271,9 @@ func addParam(key, value string) Option {
 	}
 }
 
-func addArg(key, value string) Option {
+func addArg(key string, value interface{}) Option {
 	return func(params map[string]optionValue) error {
-		if value == "" {
+		if value == nil {
 			return nil
 		}
 		params[key] = optionValue{value, optionArg}
@@ -271,7 +293,7 @@ func handleOptions(headers map[string]string, options []Option) error {
 
 	for k, v := range params {
 		if v.Type == optionHTTP {
-			headers[k] = v.Value
+			headers[k] = v.Value.(string)
 		}
 	}
 	return nil
@@ -307,18 +329,18 @@ func handleParams(options []Option) (string, error) {
 			buf.WriteByte('&')
 		}
 		buf.WriteString(prefix)
-		buf.WriteString(url.QueryEscape(vs.Value))
+		buf.WriteString(url.QueryEscape(vs.Value.(string)))
 	}
 
 	return buf.String(), nil
 }
 
-func findOption(options []Option, param, defaultVal string) (string, error) {
+func findOption(options []Option, param string, defaultVal interface{}) (interface{}, error) {
 	params := map[string]optionValue{}
 	for _, option := range options {
 		if option != nil {
 			if err := option(params); err != nil {
-				return "", err
+				return nil, err
 			}
 		}
 	}
@@ -329,12 +351,12 @@ func findOption(options []Option, param, defaultVal string) (string, error) {
 	return defaultVal, nil
 }
 
-func isOptionSet(options []Option, option string) (bool, string, error) {
+func isOptionSet(options []Option, option string) (bool, interface{}, error) {
 	params := map[string]optionValue{}
 	for _, option := range options {
 		if option != nil {
 			if err := option(params); err != nil {
-				return false, "", err
+				return false, nil, err
 			}
 		}
 	}
@@ -342,5 +364,5 @@ func isOptionSet(options []Option, option string) (bool, string, error) {
 	if val, ok := params[option]; ok {
 		return true, val.Value, nil
 	}
-	return false, "", nil
+	return false, nil, nil
 }

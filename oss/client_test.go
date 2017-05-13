@@ -1,4 +1,4 @@
-﻿// client test
+// client test
 // use gocheck, install gocheck to execute "go get gopkg.in/check.v1",
 // see https://labix.org/gocheck
 
@@ -6,6 +6,7 @@ package oss
 
 import (
 	"log"
+	"math/rand"
 	"os"
 	"strings"
 	"testing"
@@ -44,10 +45,11 @@ const (
 	// prefix of bucket name for bucket ops test
 	bucketNamePrefix = "go-sdk-test-bucket-xyz-"
 	// bucket name for object ops test
-	bucketName = "go-sdk-test-bucket-xyz-for-object"
+	bucketName        = "go-sdk-test-bucket-xyz-for-object"
+	archiveBucketName = "go-sdk-test-bucket-xyz-for-archive"
 	// object name for object ops test
-	objectNamePrefix = "go-sdk-test-object-"
-
+	objectNamePrefix = "go-sdk-test-object-xyz-"
+	// sts region is one and only hangzhou
 	stsRegion = "cn-hangzhou"
 )
 
@@ -55,7 +57,21 @@ var (
 	logPath        = "go_sdk_test_" + time.Now().Format("20060102_150405") + ".log"
 	testLogFile, _ = os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0664)
 	testLogger     = log.New(testLogFile, "", log.Ldate|log.Ltime|log.Lshortfile)
+	letters        = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 )
+
+func randStr(n int) string {
+	b := make([]rune, n)
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := range b {
+		b[i] = letters[r.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+func randLowStr(n int) string {
+	return strings.ToLower(randStr(n))
+}
 
 // Run once when the suite starts running
 func (s *OssClientSuite) SetUpSuite(c *C) {
@@ -66,8 +82,7 @@ func (s *OssClientSuite) SetUpSuite(c *C) {
 	c.Assert(err, IsNil)
 
 	for _, bucket := range lbr.Buckets {
-		err = client.DeleteBucket(bucket.Name)
-		c.Assert(err, IsNil)
+		s.deleteBucket(client, bucket.Name, c)
 	}
 
 	testLogger.Println("test client started")
@@ -82,11 +97,39 @@ func (s *OssClientSuite) TearDownSuite(c *C) {
 	c.Assert(err, IsNil)
 
 	for _, bucket := range lbr.Buckets {
-		err = client.DeleteBucket(bucket.Name)
-		c.Assert(err, IsNil)
+		s.deleteBucket(client, bucket.Name, c)
 	}
 
 	testLogger.Println("test client completed")
+}
+
+func (s *OssClientSuite) deleteBucket(client *Client, bucketName string, c *C) {
+	bucket, err := client.Bucket(bucketName)
+	c.Assert(err, IsNil)
+
+	// Delete Object
+	lor, err := bucket.ListObjects()
+	c.Assert(err, IsNil)
+
+	for _, object := range lor.Objects {
+		err = bucket.DeleteObject(object.Key)
+		c.Assert(err, IsNil)
+	}
+
+	// Delete Part
+	lmur, err := bucket.ListMultipartUploads()
+	c.Assert(err, IsNil)
+
+	for _, upload := range lmur.Uploads {
+		var imur = InitiateMultipartUploadResult{Bucket: bucketName,
+			Key: upload.Key, UploadID: upload.UploadID}
+		err = bucket.AbortMultipartUpload(imur)
+		c.Assert(err, IsNil)
+	}
+
+	// Delete Bucket
+	err = client.DeleteBucket(bucketName)
+	c.Assert(err, IsNil)
 }
 
 // Run after each test or benchmark runs
@@ -160,6 +203,45 @@ func (s *OssClientSuite) TestCreateBucket(c *C) {
 	// Delete
 	err = client.DeleteBucket(bucketNameTest)
 	c.Assert(err, IsNil)
+
+	// create bucket with config and test get bucket info
+	for _, storage := range []StorageClassType{StorageStandard, StorageIA, StorageArchive} {
+		bucketNameTest := bucketNamePrefix + randLowStr(5)
+		err = client.CreateBucket(bucketNameTest, StorageClass(storage), ACL(ACLPublicRead))
+		c.Assert(err, IsNil)
+
+		res, err := client.GetBucketInfo(bucketNameTest)
+		c.Assert(err, IsNil)
+		c.Assert(res.BucketInfo.Name, Equals, bucketNameTest)
+		c.Assert(res.BucketInfo.StorageClass, Equals, string(storage))
+		c.Assert(res.BucketInfo.ACL, Equals, string(ACLPublicRead))
+
+		// Delete
+		err = client.DeleteBucket(bucketNameTest)
+		c.Assert(err, IsNil)
+	}
+
+	// error put bucket with config
+	err = client.CreateBucket("ERRORBUCKETNAME", StorageClass(StorageArchive))
+	c.Assert(err, NotNil)
+
+	// create bucket with config and test list bucket
+	for _, storage := range []StorageClassType{StorageStandard, StorageIA, StorageArchive} {
+		bucketNameTest := bucketNamePrefix + randLowStr(5)
+		err = client.CreateBucket(bucketNameTest, StorageClass(storage))
+		c.Assert(err, IsNil)
+
+		res, err := client.ListBuckets()
+		c.Assert(err, IsNil)
+		exist, b := s.getBucket(res.Buckets, bucketNameTest)
+		c.Assert(exist, Equals, true)
+		c.Assert(b.Name, Equals, bucketNameTest)
+		c.Assert(b.StorageClass, Equals, string(storage))
+
+		// Delete
+		err = client.DeleteBucket(bucketNameTest)
+		c.Assert(err, IsNil)
+	}
 }
 
 // TestCreateBucketNegative
@@ -1331,8 +1413,8 @@ func (s *OssClientSuite) TestClientOption(c *C) {
 	c.Assert(client.Conn.config.UserAgent, Equals, "go sdk user agent")
 }
 
-// _TestProxy
-func (s *OssClientSuite) _TestProxy(c *C) {
+// TestProxy
+func (s *OssClientSuite) TestProxy(c *C) {
 	bucketNameTest := bucketNamePrefix + "tp"
 	objectName := "体育/奥运/首金"
 	objectValue := "大江东去，浪淘尽，千古风流人物。 故垒西边，人道是、三国周郎赤壁。"
@@ -1357,6 +1439,10 @@ func (s *OssClientSuite) _TestProxy(c *C) {
 	_, err = bucket.GetObject(objectName)
 	c.Assert(err, IsNil)
 
+	// List Objects
+	_, err = bucket.ListObjects()
+	c.Assert(err, IsNil)
+
 	// Delete Object
 	err = bucket.DeleteObject(objectName)
 	c.Assert(err, IsNil)
@@ -1374,4 +1460,13 @@ func (s *OssClientSuite) checkBucket(buckets []BucketProperties, bucket string) 
 		}
 	}
 	return false
+}
+
+func (s *OssClientSuite) getBucket(buckets []BucketProperties, bucket string) (bool, BucketProperties) {
+	for _, v := range buckets {
+		if v.Name == bucket {
+			return true, v
+		}
+	}
+	return false, BucketProperties{}
 }

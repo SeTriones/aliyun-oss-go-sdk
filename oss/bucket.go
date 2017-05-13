@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/xml"
+	"hash"
 	"hash/crc64"
 	"io"
 	"io/ioutil"
@@ -93,7 +94,9 @@ func (bucket Bucket) DoPutObject(request *PutObjectRequest, options []Option) (*
 		options = addContentType(options, request.ObjectKey)
 	}
 
-	resp, err := bucket.do("PUT", request.ObjectKey, "", "", options, request.Reader)
+	listener := getProgressListener(options)
+
+	resp, err := bucket.do("PUT", request.ObjectKey, "", "", options, request.Reader, listener)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +142,8 @@ func (bucket Bucket) GetObject(objectKey string, options ...Option) (io.ReadClos
 // error  操作无错误时返回error为nil，非nil为错误说明。
 //
 func (bucket Bucket) GetObjectToFile(objectKey, filePath string, options ...Option) error {
+	tempFilePath := filePath + TempFileSuffix
+
 	// 读取Object内容
 	result, err := bucket.DoGetObject(&GetObjectRequest{objectKey}, options)
 	if err != nil {
@@ -147,14 +152,14 @@ func (bucket Bucket) GetObjectToFile(objectKey, filePath string, options ...Opti
 	defer result.Response.Body.Close()
 
 	// 如果文件不存在则创建，存在则清空
-	fd, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0660)
+	fd, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, FilePermMode)
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
 
 	// 存储数据到文件
 	_, err = io.Copy(fd, result.Response.Body)
+	fd.Close()
 	if err != nil {
 		return err
 	}
@@ -165,11 +170,12 @@ func (bucket Bucket) GetObjectToFile(objectKey, filePath string, options ...Opti
 		result.Response.ClientCRC = result.ClientCRC.Sum64()
 		err = checkCRC(result.Response, "GetObjectToFile")
 		if err != nil {
+			os.Remove(tempFilePath)
 			return err
 		}
 	}
 
-	return nil
+	return os.Rename(tempFilePath, filePath)
 }
 
 //
@@ -182,7 +188,7 @@ func (bucket Bucket) GetObjectToFile(objectKey, filePath string, options ...Opti
 // error  操作无错误为nil，非nil为错误信息。
 //
 func (bucket Bucket) DoGetObject(request *GetObjectRequest, options []Option) (*GetObjectResult, error) {
-	resp, err := bucket.do("GET", request.ObjectKey, "", "", options, nil)
+	resp, err := bucket.do("GET", request.ObjectKey, "", "", options, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -191,13 +197,20 @@ func (bucket Bucket) DoGetObject(request *GetObjectRequest, options []Option) (*
 		Response: resp,
 	}
 
+	// crc
+	var crcCalc hash.Hash64
 	hasRange, _, _ := isOptionSet(options, HTTPHeaderRange)
 	if bucket.getConfig().IsEnableCRC && !hasRange {
-		crcCalc := crc64.New(crcTable())
-		resp.Body = ioutil.NopCloser(io.TeeReader(resp.Body, crcCalc))
+		crcCalc = crc64.New(crcTable())
 		result.ServerCRC = resp.ServerCRC
 		result.ClientCRC = crcCalc
 	}
+
+	// progress
+	listener := getProgressListener(options)
+
+	contentLen, _ := strconv.ParseInt(resp.Headers.Get(HTTPHeaderContentLength), 10, 64)
+	resp.Body = ioutil.NopCloser(TeeReader(resp.Body, crcCalc, contentLen, listener, nil))
 
 	return result, nil
 }
@@ -218,7 +231,7 @@ func (bucket Bucket) DoGetObject(request *GetObjectRequest, options []Option) (*
 func (bucket Bucket) CopyObject(srcObjectKey, destObjectKey string, options ...Option) (CopyObjectResult, error) {
 	var out CopyObjectResult
 	options = append(options, CopySource(bucket.BucketName, url.QueryEscape(srcObjectKey)))
-	resp, err := bucket.do("PUT", destObjectKey, "", "", options, nil)
+	resp, err := bucket.do("PUT", destObjectKey, "", "", options, nil, nil)
 	if err != nil {
 		return out, err
 	}
@@ -271,7 +284,7 @@ func (bucket Bucket) copy(srcObjectKey, destBucketName, destObjectKey string, op
 	if err != nil {
 		return out, err
 	}
-	resp, err := bucket.Client.Conn.Do("PUT", destBucketName, destObjectKey, "", "", headers, nil, 0)
+	resp, err := bucket.Client.Conn.Do("PUT", destBucketName, destObjectKey, "", "", headers, nil, 0, nil)
 	if err != nil {
 		return out, err
 	}
@@ -327,13 +340,16 @@ func (bucket Bucket) DoAppendObject(request *AppendObjectRequest, options []Opti
 	handleOptions(headers, opts)
 
 	var initCRC uint64
-	isCRCSet, initCRCStr, _ := isOptionSet(options, initCRC64)
+	isCRCSet, initCRCOpt, _ := isOptionSet(options, initCRC64)
 	if isCRCSet {
-		initCRC, _ = strconv.ParseUint(initCRCStr, 10, 64)
+		initCRC = initCRCOpt.(uint64)
 	}
 
+	listener := getProgressListener(options)
+
 	handleOptions(headers, opts)
-	resp, err := bucket.Client.Conn.Do("POST", bucket.BucketName, request.ObjectKey, params, params, headers, request.Reader, initCRC)
+	resp, err := bucket.Client.Conn.Do("POST", bucket.BucketName, request.ObjectKey, params, params, headers,
+		request.Reader, initCRC, listener)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +379,7 @@ func (bucket Bucket) DoAppendObject(request *AppendObjectRequest, options []Opti
 // error 操作无错误为nil，非nil为错误信息。
 //
 func (bucket Bucket) DeleteObject(objectKey string) error {
-	resp, err := bucket.do("DELETE", objectKey, "", "", nil, nil)
+	resp, err := bucket.do("DELETE", objectKey, "", "", nil, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -386,9 +402,8 @@ func (bucket Bucket) DeleteObjects(objectKeys []string, options ...Option) (Dele
 	for _, key := range objectKeys {
 		dxml.Objects = append(dxml.Objects, DeleteObject{Key: key})
 	}
-	isQuietStr, _ := findOption(options, deleteObjectsQuiet, "FALSE")
-	isQuiet, _ := strconv.ParseBool(isQuietStr)
-	dxml.Quiet = isQuiet
+	isQuiet, _ := findOption(options, deleteObjectsQuiet, false)
+	dxml.Quiet = isQuiet.(bool)
 	encode := "&encoding-type=url"
 
 	bs, err := xml.Marshal(dxml)
@@ -403,7 +418,7 @@ func (bucket Bucket) DeleteObjects(objectKeys []string, options ...Option) (Dele
 	sum := md5.Sum(bs)
 	b64 := base64.StdEncoding.EncodeToString(sum[:])
 	options = append(options, ContentMD5(b64))
-	resp, err := bucket.do("POST", "", "delete"+encode, "delete", options, buffer)
+	resp, err := bucket.do("POST", "", "delete"+encode, "delete", options, buffer, nil)
 	if err != nil {
 		return out, err
 	}
@@ -425,15 +440,19 @@ func (bucket Bucket) DeleteObjects(objectKeys []string, options ...Option) (Dele
 // error 操作无错误为nil，非nil为错误信息。
 //
 func (bucket Bucket) IsObjectExist(objectKey string) (bool, error) {
-	listRes, err := bucket.ListObjects(Prefix(objectKey), MaxKeys(1))
-	if err != nil {
-		return false, err
-	}
-
-	if len(listRes.Objects) == 1 && listRes.Objects[0].Key == objectKey {
+	_, err := bucket.GetObjectMeta(objectKey)
+	if err == nil {
 		return true, nil
 	}
-	return false, nil
+
+	switch err.(type) {
+	case ServiceError:
+		if err.(ServiceError).StatusCode == 404 && err.(ServiceError).Code == "NoSuchKey" {
+			return false, nil
+		}
+	}
+
+	return false, err
 }
 
 //
@@ -464,7 +483,7 @@ func (bucket Bucket) ListObjects(options ...Option) (ListObjectsResult, error) {
 		return out, err
 	}
 
-	resp, err := bucket.do("GET", "", params, "", nil, nil)
+	resp, err := bucket.do("GET", "", params, "", nil, nil, nil)
 	if err != nil {
 		return out, err
 	}
@@ -505,7 +524,7 @@ func (bucket Bucket) SetObjectMeta(objectKey string, options ...Option) error {
 // error  操作无错误为nil，非nil为错误信息。
 //
 func (bucket Bucket) GetObjectDetailedMeta(objectKey string, options ...Option) (http.Header, error) {
-	resp, err := bucket.do("HEAD", objectKey, "", "", options, nil)
+	resp, err := bucket.do("HEAD", objectKey, "", "", options, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +545,7 @@ func (bucket Bucket) GetObjectDetailedMeta(objectKey string, options ...Option) 
 // error 操作无错误为nil，非nil为错误信息。
 //
 func (bucket Bucket) GetObjectMeta(objectKey string) (http.Header, error) {
-	resp, err := bucket.do("GET", objectKey, "?objectMeta", "", nil, nil)
+	resp, err := bucket.do("GET", objectKey, "?objectMeta", "", nil, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +573,7 @@ func (bucket Bucket) GetObjectMeta(objectKey string) (http.Header, error) {
 //
 func (bucket Bucket) SetObjectACL(objectKey string, objectACL ACLType) error {
 	options := []Option{ObjectACL(objectACL)}
-	resp, err := bucket.do("PUT", objectKey, "acl", "acl", options, nil)
+	resp, err := bucket.do("PUT", objectKey, "acl", "acl", options, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -572,7 +591,7 @@ func (bucket Bucket) SetObjectACL(objectKey string, objectACL ACLType) error {
 //
 func (bucket Bucket) GetObjectACL(objectKey string) (GetObjectACLResult, error) {
 	var out GetObjectACLResult
-	resp, err := bucket.do("GET", objectKey, "acl", "acl", nil, nil)
+	resp, err := bucket.do("GET", objectKey, "acl", "acl", nil, nil, nil)
 	if err != nil {
 		return out, err
 	}
@@ -582,16 +601,84 @@ func (bucket Bucket) GetObjectACL(objectKey string) (GetObjectACLResult, error) 
 	return out, err
 }
 
+//
+// PutSymlink 创建符号链接。
+//
+// 符号链接的目标文件类型不能为符号链接。
+// 创建符号链接时: 不检查目标文件是否存在, 不检查目标文件类型是否合法, 不检查目标文件是否有权限访问。
+// 以上检查，都推迟到GetObject等需要访问目标文件的API。
+// 如果试图添加的文件已经存在，并且有访问权限。新添加的文件将覆盖原来的文件。
+// 如果在PutSymlink的时候，携带以x-oss-meta-为前缀的参数，则视为user meta。
+//
+// symObjectKey 要创建的符号链接文件。
+// targetObjectKey 目标文件。
+//
+// error 操作无错误为nil，非nil为错误信息。
+//
+func (bucket Bucket) PutSymlink(symObjectKey string, targetObjectKey string, options ...Option) error {
+	options = append(options, symlinkTarget(url.QueryEscape(targetObjectKey)))
+	resp, err := bucket.do("PUT", symObjectKey, "symlink", "symlink", options, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return checkRespCode(resp.StatusCode, []int{http.StatusOK})
+}
+
+//
+// GetSymlink 获取符号链接的目标文件。
+// 如果符号链接不存在返回404。
+//
+// objectKey 获取目标文件的符号链接object。
+//
+// error 操作无错误为nil，非nil为错误信息。当error为nil时，返回的string为目标文件，否则该值无效。
+//
+func (bucket Bucket) GetSymlink(objectKey string) (http.Header, error) {
+	resp, err := bucket.do("GET", objectKey, "symlink", "symlink", nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	targetObjectKey := resp.Headers.Get(HTTPHeaderOssSymlinkTarget)
+	targetObjectKey, err = url.QueryUnescape(targetObjectKey)
+	if err != nil {
+		return resp.Headers, err
+	}
+	resp.Headers.Set(HTTPHeaderOssSymlinkTarget, targetObjectKey)
+	return resp.Headers, err
+}
+
+//
+// RestoreObject 恢复处于冷冻状态的归档类型Object进入读就绪状态。
+//
+// 如果是针对该Object第一次调用restore接口，则返回成功。
+// 如果已经成功调用过restore接口，且restore没有完全完成，再次调用时返回409，错误码：RestoreAlreadyInProgress。
+// 如果已经成功调用过restore接口，且restore已经完成，再次调用时返回成功，且会将object的可下载时间延长一天，最多延长7天。
+//
+// objectKey 需要恢复状态的object名称。
+//
+// error 操作无错误为nil，非nil为错误信息。
+//
+func (bucket Bucket) RestoreObject(objectKey string) error {
+	resp, err := bucket.do("POST", objectKey, "restore", "restore", nil, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return checkRespCode(resp.StatusCode, []int{http.StatusOK, http.StatusAccepted})
+}
+
 // Private
-func (bucket Bucket) do(method, objectName, urlParams, subResource string,
-	options []Option, data io.Reader) (*Response, error) {
+func (bucket Bucket) do(method, objectName, urlParams, subResource string, options []Option,
+	data io.Reader, listener ProgressListener) (*Response, error) {
 	headers := make(map[string]string)
 	err := handleOptions(headers, options)
 	if err != nil {
 		return nil, err
 	}
 	return bucket.Client.Conn.Do(method, bucket.BucketName, objectName,
-		urlParams, subResource, headers, data, 0)
+		urlParams, subResource, headers, data, 0, listener)
 }
 
 func (bucket Bucket) getConfig() *Config {
